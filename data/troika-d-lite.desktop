@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Troika D Lite
+GenericName=Screen and Audio Recorder
+Comment=Record the screen and audio on Wayland
+Exec=troika-d-lite
+Icon=media-record
+Terminal=false
+Categories=AudioVideo;Recorder;
+Keywords=record;screen;audio;screencast;wayland;
+StartupNotify=true
+
