@@ -12,7 +12,7 @@ is explicitly marked as a procedure for the reader to run.
 python3 -m pytest tests/ -q
 ```
 
-**Result on the development machine: 138 passed.**
+**Result on the development machine: 153 passed.**
 
 | File | What it protects |
 | --- | --- |
@@ -85,6 +85,9 @@ executed through the **production** `Recorder` and pipeline code:
 | Screen + system audio, 15 FPS | video 15.0 FPS effective, **zero gaps**, playable |
 | Screen + microphone, 15 FPS | video 15.0 FPS effective, **zero gaps**, playable |
 | Two-minute screen + system audio + microphone, 30 FPS | 3608 video buffers, 6015 audio buffers, **zero gaps** in either stream, A/V durations 120.233 s vs 120.273 s, peak RSS 111.5 MB, ~18% of one CPU |
+| Three-minute microphone-only recording | 180.60 s decoded, 9029 × 20 ms windows analysed, 1 silent window (0.0%), median RMS 18607, no audible gaps |
+| Generated video + **real** system audio + **real** microphone, 30 FPS | 918 video buffers at 30.00 FPS, 1531 audio buffers at 50.01/s, **zero gaps** in either stream, A/V durations 30.6 s vs 30.6 s, stereo Opus, non-silent |
+| Audio-only resource use | RSS steady at 42.1 MB across the run, ~1.2% of one CPU |
 | Stop pressed during the permission dialog | cancels immediately, releases the session, returns to idle |
 | Recorder reuse after that abort | starts again normally |
 | Window closed mid-recording | file finalised and decodable; 11.8 s of a 12 s recording, no truncation |

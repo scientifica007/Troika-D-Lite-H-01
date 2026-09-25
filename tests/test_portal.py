@@ -26,30 +26,39 @@ CONTENT_TYPE = 2
 
 
 class FakePortalProxy:
-    """A portal object whose methods hand back request handles."""
+    """A portal object whose methods hand back request handles.
 
-    def __init__(self):
+    The handles are built the way the real portal builds them: from the
+    ``handle_token`` the caller supplied. That matters, because the session
+    subscribes to the request path *before* making the call, and this fake lets
+    the tests prove that prediction is correct.
+    """
+
+    def __init__(self, events=None):
         self.calls: list[tuple[str, tuple]] = []
-        self._counter = 0
+        self.events = events if events is not None else []
         # File descriptors handed out by OpenPipeWireRemote. They must be real
         # descriptors, because the session genuinely closes them.
         self.opened_fds: list[int] = []
 
-    def _new_handle(self, name: str) -> str:
-        self._counter += 1
-        return f"/org/freedesktop/portal/desktop/request/1_42/troika_{name}_{self._counter}"
+    def _handle_for(self, options) -> str:
+        token = str(dict(options).get("handle_token", ""))
+        return f"/org/freedesktop/portal/desktop/request/1_42/{token}"
 
-    def CreateSession(self, _options, **_kwargs):
+    def CreateSession(self, options, **_kwargs):
         self.calls.append(("CreateSession", ()))
-        return self._new_handle("create")
+        self.events.append(("call", "CreateSession"))
+        return self._handle_for(options)
 
-    def SelectSources(self, handle, _options, **_kwargs):
+    def SelectSources(self, handle, options, **_kwargs):
         self.calls.append(("SelectSources", (str(handle),)))
-        return self._new_handle("select")
+        self.events.append(("call", "SelectSources"))
+        return self._handle_for(options)
 
-    def Start(self, handle, _parent, _options, **_kwargs):
+    def Start(self, handle, _parent, options, **_kwargs):
         self.calls.append(("Start", (str(handle),)))
-        return self._new_handle("start")
+        self.events.append(("call", "Start"))
+        return self._handle_for(options)
 
     def OpenPipeWireRemote(self, handle, _options, **_kwargs):
         self.calls.append(("OpenPipeWireRemote", (str(handle),)))
@@ -78,8 +87,8 @@ class _FakeFd:
 class FakeBus:
     def __init__(self):
         self.requests: dict[str, object] = {}
-        self.proxy = FakePortalProxy()
-        self.dispatcher: object | None = None
+        self.events: list[tuple] = []
+        self.proxy = FakePortalProxy(events=self.events)
 
     def get_unique_name(self) -> str:
         return ":1.42"
@@ -88,36 +97,43 @@ class FakeBus:
         return self.proxy
 
     def add_signal_receiver(self, handler, signal_name="", **kwargs):
+        path = kwargs.get("path")
+        self.events.append(("subscribe", path))
         if signal_name == "Response":
-            path = kwargs.get("path")
             self.requests[str(path)] = handler
-        return _Subscription()
+        return _Subscription(self, str(path))
 
-    def remove_signal_receiver(self, _subscription):
-        pass
+    def remove_signal_receiver(self, subscription):
+        self.requests.pop(subscription.path, None)
 
 
 class _Subscription:
-    def __init__(self):
-        self.removed = False
+    def __init__(self, bus, path):
+        self.bus = bus
+        self.path = path
 
-    def remove(self):  # pragma: no cover - exercised only via the dispatcher
-        self.removed = True
+    def remove(self):
+        self.bus.remove_signal_receiver(self)
 
 
 class FakeSession(ScreenCastSession):
-    """A session wired to fakes instead of a live D-Bus session bus."""
+    """A session wired to fakes instead of a live D-Bus session bus.
+
+    The *real* request dispatcher is used, so these tests cover the routing
+    logic rather than a simplified stand-in for it.
+    """
 
     def __init__(self, bus=None):
         super().__init__(timeout_seconds=5)
         self.fake_bus = bus or FakeBus()
 
     def _connect(self) -> None:
+        from troika.portal import _RequestDispatcher
+
         self._bus = self.fake_bus
         self._desktop = self.fake_bus.proxy
         self._sender_token = "1_42"
-        self._dispatcher = _FakeDispatcher(self.fake_bus)
-        self.fake_bus.dispatcher = self._dispatcher
+        self._dispatcher = _RequestDispatcher(self.fake_bus)
 
     def _has_screencast_interface(self) -> bool:
         return True
@@ -125,21 +141,6 @@ class FakeSession(ScreenCastSession):
     def _arm_timeout(self) -> None:
         # No GLib main loop in the tests, so the timeout is not armed.
         return
-
-
-class _FakeDispatcher:
-    """Registers request handlers so responses can be delivered by the test."""
-
-    def __init__(self, bus):
-        self.bus = bus
-        self.closed = False
-
-    def expect(self, request_path, callback):
-        self.bus.requests[str(request_path)] = callback
-
-    def close(self) -> None:
-        self.closed = True
-        self.bus.requests.clear()
 
 
 @pytest.fixture
@@ -161,16 +162,35 @@ def opened(session):
     session.close()
 
 
+@pytest.fixture
+def open_session():
+    """Factory for fake-backed sessions, all closed at teardown.
+
+    Returns the session so a test can inspect the requests it registered.
+    """
+    created: list[FakeSession] = []
+
+    def make() -> FakeSession:
+        session = FakeSession()
+        created.append(session)
+        return session
+
+    yield make
+    for session in created:
+        session.close()
+
+
 def respond(session, handle_name: str, response: int, results: dict) -> None:
     """Deliver a portal response to the callback registered for *handle_name*.
 
-    Mirrors ``_RequestDispatcher._on_response``, which invokes the registered
-    callback with ``(response, results)``.
+    The session subscribes to the request path before issuing the call, so a
+    pending handler must already exist for the token it chose. Finding one here
+    is itself the check that the predicted path was right.
     """
     matching = [
         (path, handler)
         for path, handler in session.fake_bus.requests.items()
-        if f"troika_{handle_name}_" in path
+        if path.rsplit("/", 1)[-1].startswith(f"troika_{handle_name}")
     ]
     assert matching, f"no pending request for {handle_name}: {list(session.fake_bus.requests)}"
     _path, handler = matching[-1]
@@ -388,10 +408,13 @@ def test_close_drops_the_pending_response_callback(opened) -> None:
 
 def test_close_stops_listening_for_portal_responses(opened) -> None:
     session, _ready, _errors = opened
+    assert session.fake_bus.requests, "a request must be pending before close"
+
     session.close()
 
     assert session._dispatcher is None
-    assert session.fake_bus.dispatcher.closed is True
+    # The bus no longer holds any handler, so a late response cannot be routed.
+    assert session.fake_bus.requests == {}
 
 
 def test_a_close_failure_is_swallowed(opened) -> None:
@@ -425,3 +448,93 @@ def test_stream_close_only_releases_the_fd_once() -> None:
     # The descriptor is genuinely closed, so a duplicate close cannot resurface.
     with pytest.raises(OSError):
         os.fstat(read_fd)
+
+
+# -- response routing ---------------------------------------------------------
+
+
+def test_every_response_is_subscribed_before_its_call_is_made(open_session) -> None:
+    """The subscription must exist before the call can produce a response.
+
+    python-dbus only reports the object path for a path-specific subscription,
+    so the session subscribes to the request path it predicts from its own
+    handle token. If a call were made first, a fast portal response would be
+    emitted with nobody listening and the session would stall silently. That is
+    exactly the failure this guards against.
+    """
+    session = open_session()
+    session.open(on_ready=lambda _s: None, on_error=lambda _e: None)
+
+    events = session.fake_bus.events
+    assert events[0] == ("subscribe", session._request_path("troika_create1"))
+    assert events[1] == ("call", "CreateSession")
+
+    respond(session, "create", RESPONSE_SUCCESS, {"session_handle": "/s/1"})
+    assert ("subscribe", session._request_path("troika_select2")) in events
+    assert events.index(("call", "SelectSources")) < len(events)
+
+
+def test_the_subscription_path_matches_the_portal_handle(open_session) -> None:
+    """The predicted path must equal the handle the portal actually returns.
+
+    A mismatch means the response would arrive on a path nobody subscribed to.
+    """
+    session = open_session()
+    session.open(on_ready=lambda _s: None, on_error=lambda _e: None)
+
+    predicted = session._request_path("troika_create1")
+    actual = session.fake_bus.proxy.CreateSession(
+        session._options("troika_create1")
+    )
+
+    assert predicted == str(actual)
+
+
+def test_responses_are_not_delivered_without_a_path_specific_subscription(
+    open_session,
+) -> None:
+    """A bus-wide subscription cannot route responses, so none is installed.
+
+    The old implementation attached one wildcard receiver. python-dbus handed it
+    ``path=None`` for every response, so no callback was ever matched. This test
+    pins the per-path design that replaced it.
+    """
+    session = open_session()
+    session.open(on_ready=lambda _s: None, on_error=lambda _e: None)
+
+    subscribed_paths = [
+        path for kind, path in session.fake_bus.events if kind == "subscribe"
+    ]
+    assert subscribed_paths, "the session must subscribe to its request"
+    assert all(path for path in subscribed_paths), (
+        "a subscription without an explicit path cannot be routed"
+    )
+
+
+def test_an_unexpected_handle_path_is_still_followed(open_session) -> None:
+    """A portal that ignores our token must not strand the session.
+
+    The handle token is a hint. If a portal picks its own request path, the
+    session subscribes to the returned one as well, so the response is not lost.
+    """
+    session = open_session()
+    session.fake_bus.proxy.CreateSession = lambda _options, **_k: (
+        "/org/freedesktop/portal/desktop/request/1_42/portal_chose_this"
+    )
+    session.open(on_ready=lambda _s: None, on_error=lambda _e: None)
+
+    assert (
+        "/org/freedesktop/portal/desktop/request/1_42/portal_chose_this"
+        in session.fake_bus.requests
+    )
+
+
+def test_closing_removes_every_subscription(open_session) -> None:
+    """No subscription may outlive the session that created it."""
+    session = open_session()
+    session.open(on_ready=lambda _s: None, on_error=lambda _e: None)
+    respond(session, "create", RESPONSE_SUCCESS, {"session_handle": "/s/1"})
+
+    session.close()
+
+    assert session.fake_bus.requests == {}

@@ -70,37 +70,42 @@ class ScreenCastStream:
 
 
 class _RequestDispatcher:
-    """Routes portal ``Response`` signals to per-request callbacks."""
+    """Routes portal ``Response`` signals to per-request callbacks.
 
-    def __init__(self, bus, main_context=None) -> None:
+    Every request gets its own exact-path subscription. A single bus-wide
+    receiver does not work here: python-dbus only reports the object path a
+    signal arrived on when the subscription is path-specific, so a wildcard
+    receiver sees the response but cannot tell which request produced it. The
+    request path is deterministic (``.../request/<sender>/<token>``), so the
+    path is known before the call is made and nothing can be missed.
+    """
+
+    def __init__(self, bus) -> None:
         self._bus = bus
-        self._callbacks: dict[str, Callable[[int, dict], None]] = {}
-        self._main_context = main_context
-        self._match = bus.add_signal_receiver(
-            self._on_response,
-            signal_name="Response",
-            dbus_interface=REQUEST_IFACE,
-            bus_name=BUS_NAME,
-        )
-
-    def _on_response(self, response, results, path=None, *_args) -> None:
-        callback = self._callbacks.pop(str(path), None)
-        if callback is not None:
-            callback(int(response), dict(results or {}))
+        self._matches: dict[str, object] = {}
 
     def expect(self, request_path: str, callback: Callable[[int, dict], None]) -> None:
-        self._callbacks[str(request_path)] = callback
+        path = str(request_path)
+        if path in self._matches:
+            return
+        self._matches[path] = self._bus.add_signal_receiver(
+            lambda response, results: callback(int(response), dict(results or {})),
+            signal_name="Response",
+            dbus_interface=REQUEST_IFACE,
+            path=path,
+        )
 
     def close(self) -> None:
-        """Drop pending callbacks and stop listening for responses.
+        """Drop every pending subscription.
 
-        The signal receiver is bus-wide, so leaving it attached after a session
-        ends would let a late response from a previous session invoke a stale
-        callback. It is removed here so each session owns exactly one receiver.
+        Leaving them attached would let a late response from a finished session
+        invoke a stale callback.
         """
-        self._callbacks.clear()
-        match = self._match
-        self._match = None
+        matches, self._matches = self._matches, {}
+        for match in matches.values():
+            self._remove(match)
+
+    def _remove(self, match) -> None:
         if match is None:
             return
         remove = getattr(match, "remove", None)
@@ -277,10 +282,39 @@ class ScreenCastSession:
         self._pending_request = str(request_path)
         self._dispatcher.expect(str(request_path), callback)
 
+    def _request_path(self, token: str) -> str:
+        """The request object path the portal will use for *token*.
+
+        The portal builds it from our unique name and the handle token, so it is
+        known before the call is made. That matters: the subscription has to be
+        in place first, or a fast response would be missed.
+        """
+        return (
+            f"{OBJECT_PATH}/request/{self._sender_token}/{token}"
+        )
+
+    def _arm(self, token: str, callback) -> str:
+        """Subscribe for *token*'s response and return its request path."""
+        path = self._request_path(token)
+        self._expect(path, callback)
+        return path
+
+    def _rearm_if_needed(self, handle, expected_path: str, callback) -> None:
+        """Follow the portal's actual request path if it ignored our token.
+
+        The handle token is only a hint; a portal is free to pick its own path.
+        The call has already returned by now, so re-subscribing cannot miss a
+        response that has not been emitted yet.
+        """
+        actual = str(handle)
+        if actual and actual != expected_path:
+            self._expect(actual, callback)
+
     def _create_session(self) -> None:
         import dbus
 
         token = self._next_token("troika_create")
+        expected = self._arm(token, self._on_session_created)
         try:
             handle = self._desktop.CreateSession(
                 self._options(
@@ -291,7 +325,7 @@ class ScreenCastSession:
         except Exception as exc:
             self._fail(PortalError(f"CreateSession failed: {exc}"))
             return
-        self._expect(handle, self._on_session_created)
+        self._rearm_if_needed(handle, expected, self._on_session_created)
 
     def _on_session_created(self, response: int, results: dict) -> None:
         if response != RESPONSE_SUCCESS:
@@ -307,6 +341,7 @@ class ScreenCastSession:
         import dbus
 
         token = self._next_token("troika_select")
+        expected = self._arm(token, self._on_sources_selected)
         try:
             handle = self._desktop.SelectSources(
                 dbus.ObjectPath(self._session_handle),
@@ -321,7 +356,7 @@ class ScreenCastSession:
         except Exception as exc:
             self._fail(PortalError(f"SelectSources failed: {exc}"))
             return
-        self._expect(handle, self._on_sources_selected)
+        self._rearm_if_needed(handle, expected, self._on_sources_selected)
 
     def _on_sources_selected(self, response: int, _results: dict) -> None:
         if response != RESPONSE_SUCCESS:
@@ -333,6 +368,7 @@ class ScreenCastSession:
         import dbus
 
         token = self._next_token("troika_start")
+        expected = self._arm(token, self._on_started)
         try:
             handle = self._desktop.Start(
                 dbus.ObjectPath(self._session_handle),
@@ -343,7 +379,7 @@ class ScreenCastSession:
         except Exception as exc:
             self._fail(PortalError(f"Start failed: {exc}"))
             return
-        self._expect(handle, self._on_started)
+        self._rearm_if_needed(handle, expected, self._on_started)
 
     def _on_started(self, response: int, results: dict) -> None:
         if response != RESPONSE_SUCCESS:
