@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "troika-d-lite"
+version = "1.0.0"
+description = "A small, reliable screen and audio recorder for Ubuntu Wayland desktops"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+# Runtime dependencies are deliberately all system packages. Troika D Lite does
+# not pull anything from PyPI, so it keeps working offline after installation.
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+troika-d-lite = "troika.__main__:main"
+troika-selftest = "troika.selftest:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

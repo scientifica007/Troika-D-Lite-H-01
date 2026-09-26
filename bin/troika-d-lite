@@ -1,0 +1,27 @@
+#!/usr/bin/env python3
+"""Launch Troika D Lite.
+
+Works both from a git checkout (where the package lives in ``../src``) and from
+an installed copy (where the package is already importable).
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_SRC = _REPO_ROOT / "src"
+if (_SRC / "troika").is_dir() and str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+from troika.interpreter import ensure_gi_capable_interpreter  # noqa: E402
+
+# ``python3`` on PATH may be a pyenv/conda build that cannot see the system
+# ``gi`` bindings, so re-exec with a system interpreter before loading the app.
+ensure_gi_capable_interpreter()
+
+from troika.__main__ import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main())
