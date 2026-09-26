@@ -37,10 +37,48 @@ class AudioDevice:
         return not self.is_monitor
 
 
-def _properties_to_dict(props) -> dict[str, object]:
+def _structure_field_names(props) -> list[str]:
+    """Return the field names of a ``Gst.Structure`` on any PyGObject build.
+
+    ``Gst.Structure`` exposes ``n_fields()`` and ``nth_field_name(index)``
+    everywhere, but ``keys()`` only on some bindings: on Ubuntu 24.04's
+    PyGObject a ``Structure`` has no ``keys`` at all, so relying on it crashed
+    device enumeration at startup. The index-based API is the portable one and
+    is preferred; ``keys()`` is kept as a fallback for bindings that offer it.
+    """
     if props is None:
-        return {}
-    return {key: props.get_value(key) for key in props.keys()}
+        return []
+
+    keys = getattr(props, "keys", None)
+    if callable(keys):
+        try:
+            return [str(key) for key in keys()]
+        except Exception:
+            pass
+
+    names: list[str] = []
+    try:
+        count = int(props.n_fields())
+    except Exception:
+        return names
+    for index in range(count):
+        try:
+            names.append(str(props.nth_field_name(index)))
+        except Exception:
+            continue
+    return names
+
+
+def _properties_to_dict(props) -> dict[str, object]:
+    """Convert a ``Gst.Structure`` into a plain dict, tolerating odd values."""
+    result: dict[str, object] = {}
+    for key in _structure_field_names(props):
+        try:
+            result[key] = props.get_value(key)
+        except Exception:
+            # A field we cannot read is not worth failing enumeration over.
+            continue
+    return result
 
 
 def _is_monitor(display_name: str, properties: dict[str, object]) -> bool:
@@ -50,11 +88,40 @@ def _is_monitor(display_name: str, properties: dict[str, object]) -> bool:
     return display_name.startswith("Monitor of ")
 
 
+def _device_from_gstreamer(device) -> AudioDevice | None:
+    """Interpret one ``Gst.Device``, or return ``None`` if it is unusable.
+
+    Kept separate and defensive because the properties of a single device are
+    not worth failing the whole enumeration over: the caller still has the
+    ``pactl`` fallback, and a device we cannot describe is simply not offered.
+    """
+    props = _properties_to_dict(device.get_properties())
+    # ``node.name`` is what PipeWire and pulsesrc both accept.
+    name = props.get("node.name") or props.get("device.name")
+    if not name:
+        try:
+            element = device.create_element(None)
+            name = element.get_property("device")
+        except Exception:
+            name = None
+    if not name:
+        return None
+    display = device.get_display_name() or str(name)
+    return AudioDevice(
+        name=str(name),
+        label=display,
+        is_monitor=_is_monitor(display, props),
+        is_default=bool(props.get("is-default")),
+    )
+
+
 def enumerate_via_gstreamer() -> list[AudioDevice]:
     """Enumerate audio inputs using ``Gst.DeviceMonitor``.
 
-    Returns an empty list if GStreamer is unavailable or finds nothing, so the
-    caller can fall back to another mechanism.
+    Best-effort by contract: this returns whatever it could interpret, and an
+    empty list if GStreamer is unavailable, finds nothing, or misbehaves. It
+    never raises, so a binding difference or a single unreadable device cannot
+    stop the application from starting — the caller falls back to ``pactl``.
     """
     try:
         import gi
@@ -64,40 +131,29 @@ def enumerate_via_gstreamer() -> list[AudioDevice]:
     except (ImportError, ValueError):
         return []
 
-    if not Gst.is_initialized():
-        Gst.init(None)
-
-    monitor = Gst.DeviceMonitor.new()
-    monitor.add_filter("Audio/Source", None)
-    if not monitor.start():
-        return []
-
-    devices: list[AudioDevice] = []
     try:
-        for device in monitor.get_devices():
-            props = _properties_to_dict(device.get_properties())
-            # ``node.name`` is what PipeWire and pulsesrc both accept.
-            name = props.get("node.name") or props.get("device.name")
-            if not name:
+        if not Gst.is_initialized():
+            Gst.init(None)
+
+        monitor = Gst.DeviceMonitor.new()
+        monitor.add_filter("Audio/Source", None)
+        if not monitor.start():
+            return []
+
+        devices: list[AudioDevice] = []
+        try:
+            for device in monitor.get_devices():
                 try:
-                    element = device.create_element(None)
-                    name = element.get_property("device")
+                    parsed = _device_from_gstreamer(device)
                 except Exception:
-                    name = None
-            if not name:
-                continue
-            display = device.get_display_name() or str(name)
-            devices.append(
-                AudioDevice(
-                    name=str(name),
-                    label=display,
-                    is_monitor=_is_monitor(display, props),
-                    is_default=bool(props.get("is-default")),
-                )
-            )
-    finally:
-        monitor.stop()
-    return devices
+                    parsed = None
+                if parsed is not None:
+                    devices.append(parsed)
+        finally:
+            monitor.stop()
+        return devices
+    except Exception:
+        return []
 
 
 def parse_pactl_sources(payload: str) -> list[AudioDevice]:
@@ -164,6 +220,20 @@ def _merge(primary: list[AudioDevice], secondary: list[AudioDevice]) -> list[Aud
     return list(merged.values())
 
 
+def _safe(enumerator) -> list[AudioDevice]:
+    """Run one enumerator, treating any failure as "found nothing".
+
+    Enumeration is best-effort by design, and the application must still start
+    when a backend misbehaves — a binding difference or a broken device monitor
+    should cost the user a device list, not the whole program. The other
+    enumerator is then still consulted.
+    """
+    try:
+        return enumerator()
+    except Exception:
+        return []
+
+
 def list_input_devices() -> list[AudioDevice]:
     """Return every selectable audio input, microphones first.
 
@@ -171,7 +241,10 @@ def list_input_devices() -> list[AudioDevice]:
     device the user actively chooses; monitors are normally selected implicitly
     by the audio mode.
     """
-    devices = _merge(enumerate_via_gstreamer(), enumerate_via_pactl())
+    devices = _merge(
+        _safe(enumerate_via_gstreamer),
+        _safe(enumerate_via_pactl),
+    )
     devices.sort(key=lambda d: (d.is_monitor, not d.is_default, d.label.lower()))
     return devices
 

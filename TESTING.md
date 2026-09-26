@@ -12,13 +12,13 @@ is explicitly marked as a procedure for the reader to run.
 python3 -m pytest tests/ -q
 ```
 
-**Result on the development machine: 153 passed.**
+**Result on the development machine: 161 passed.**
 
 | File | What it protects |
 | --- | --- |
 | `test_config.py` | Mode validation, derived flags, rejection of impossible combinations. |
 | `test_filenames.py` | Timestamped names, collision suffixes, atomic path claiming, unwritable and full destinations. |
-| `test_devices.py` | Microphone vs monitor classification, `pactl` fallback parsing, default-device choice. |
+| `test_devices.py` | Microphone vs monitor classification, `pactl` fallback parsing, default-device choice, and `Gst.Structure` property reading on bindings that expose no `keys()`. |
 | `test_pipeline_plan.py` | The whole mode matrix: which sources, encoders, containers and clock roles each configuration produces. |
 | `test_pipeline_build.py` | **Real GStreamer pipelines**: negotiated caps, frame-rate pinning, audio normalisation, stereo mixing, probe attachment, and error propagation. |
 | `test_portal.py` | Portal request sequencing, cancellation, late/duplicate responses, session teardown. |
@@ -40,6 +40,26 @@ that the planning tests could not see:
 
 Both are now covered by regression tests that were confirmed to fail when the
 fixes are reverted.
+
+A third defect was found by **human testing on a real Ubuntu 24.04 Wayland
+machine**, not by the suite:
+
+* `devices._properties_to_dict` read `Gst.Structure` fields through `keys()`.
+  PyGObject on Ubuntu 24.04 does not expose `keys()` on a `Structure` at all,
+  so the GUI died at startup with
+  `AttributeError: 'Structure' object has no attribute 'keys'` during the first
+  device enumeration. The field list now comes from the portable index API
+  (`n_fields()` / `nth_field_name()`), with `keys()` still used when a binding
+  offers it. The same commit makes `enumerate_via_gstreamer()` honour its
+  documented best-effort contract: one unreadable device, or a failing monitor,
+  now yields an empty list instead of an exception, so `pactl` enumeration is
+  still reached and the window always opens.
+
+This is exactly the class of bug a development container cannot catch: the
+suite, the self-test and every headless run passed while the application was
+unusable on the target machine. The regression tests added for it build a
+stand-in object with no `keys()` attribute, so they fail on the old code and
+pass on the new code without depending on the local PyGObject build.
 
 ## 2. Media self-test
 

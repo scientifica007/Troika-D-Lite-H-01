@@ -62,6 +62,7 @@ The launchers work straight from a checkout, so this is enough to try it:
 
 ```bash
 sudo apt install python3-gi python3-gi-cairo python3-dbus gir1.2-gtk-4.0 \
+    gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 \
     gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
     gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-pipewire
 
@@ -143,6 +144,21 @@ pactl list short sources | grep -i monitor
 
 If nothing is listed, make sure PipeWire and WirePlumber are running and that
 you are not on a session where the monitor is deliberately hidden.
+
+**The application exits immediately with a Python traceback.**
+Run it from a terminal and read the last line. A `ModuleNotFoundError: No module
+named 'gi'` means the system Python bindings are missing, and
+`Namespace Gst not available` means the GStreamer introspection data is missing.
+Both come from the same install:
+
+```bash
+sudo apt install python3-gi python3-gi-cairo python3-dbus \
+    gir1.2-gtk-4.0 gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0
+```
+
+Note that `gstreamer1.0-plugins-*` installs the plugins but **not** the Python
+introspection data, so `gir1.2-gstreamer-1.0` is required even when
+`gst-launch-1.0` already works.
 
 **A USB microphone does not appear.**
 Press **Refresh devices** after plugging it in. Devices are enumerated on

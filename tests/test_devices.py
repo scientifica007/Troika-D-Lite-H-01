@@ -165,3 +165,172 @@ def test_list_input_devices_sorts_microphones_first(monkeypatch) -> None:
 
     ordered = devices.list_input_devices()
     assert ordered[0].name == "mic"
+
+
+class _StructureWithoutKeys:
+    """A ``Gst.Structure`` as PyGObject on Ubuntu 24.04 presents it.
+
+    That build exposes no ``keys()`` at all, only the index-based field API.
+    Reading properties through ``keys()`` therefore raised
+    ``AttributeError: 'Structure' object has no attribute 'keys'`` and killed
+    the GUI at startup. This stand-in keeps that shape so the regression cannot
+    come back.
+    """
+
+    def __init__(self, fields: dict[str, object]) -> None:
+        self._fields = list(fields.items())
+
+    def n_fields(self) -> int:
+        return len(self._fields)
+
+    def nth_field_name(self, index: int) -> str:
+        return self._fields[index][0]
+
+    def get_value(self, name: str):
+        for key, value in self._fields:
+            if key == name:
+                return value
+        raise KeyError(name)
+
+
+def test_properties_are_read_without_a_keys_method() -> None:
+    props = _StructureWithoutKeys(
+        {"node.name": "alsa_input.usb-Yeti", "device.class": "monitor"}
+    )
+    assert not hasattr(props, "keys")
+
+    assert devices._properties_to_dict(props) == {
+        "node.name": "alsa_input.usb-Yeti",
+        "device.class": "monitor",
+    }
+
+
+def test_properties_use_keys_when_the_binding_provides_it() -> None:
+    class _WithKeys:
+        def __init__(self, fields: dict[str, object]) -> None:
+            self._fields = fields
+
+        def keys(self):
+            return self._fields.keys()
+
+        def get_value(self, name: str):
+            return self._fields[name]
+
+    props = _WithKeys({"node.name": "mic", "is-default": True})
+    assert devices._properties_to_dict(props) == {
+        "node.name": "mic",
+        "is-default": True,
+    }
+
+
+def test_properties_tolerate_a_structure_with_nothing_readable() -> None:
+    class _Broken:
+        def n_fields(self) -> int:
+            raise RuntimeError("binding is unhappy")
+
+    assert devices._properties_to_dict(_Broken()) == {}
+    assert devices._properties_to_dict(None) == {}
+
+
+def test_an_unreadable_field_does_not_discard_the_others() -> None:
+    class _PartlyBroken(_StructureWithoutKeys):
+        def get_value(self, name: str):
+            if name == "device.class":
+                raise RuntimeError("unreadable")
+            return super().get_value(name)
+
+    props = _PartlyBroken({"node.name": "mic", "device.class": "monitor"})
+    assert devices._properties_to_dict(props) == {"node.name": "mic"}
+
+
+def test_device_is_interpreted_without_a_keys_method() -> None:
+    class _Device:
+        def get_properties(self):
+            return _StructureWithoutKeys(
+                {"node.name": "alsa_input.usb-Yeti", "is-default": True}
+            )
+
+        def get_display_name(self) -> str:
+            return "Blue Yeti"
+
+    parsed = devices._device_from_gstreamer(_Device())
+    assert parsed is not None
+    assert parsed.name == "alsa_input.usb-Yeti"
+    assert parsed.label == "Blue Yeti"
+    assert parsed.is_microphone
+
+
+def test_one_unreadable_device_does_not_stop_enumeration(monkeypatch) -> None:
+    class _Good:
+        def get_properties(self):
+            return _StructureWithoutKeys({"node.name": "mic"})
+
+        def get_display_name(self) -> str:
+            return "Mic"
+
+    class _Bad:
+        def get_properties(self):
+            raise RuntimeError("device is unreadable")
+
+        def get_display_name(self) -> str:
+            return "Bad"
+
+    class _Monitor:
+        def __init__(self) -> None:
+            self._devices = [_Bad(), _Good()]
+
+        def add_filter(self, *_args) -> None:
+            pass
+
+        def start(self) -> bool:
+            return True
+
+        def get_devices(self):
+            return list(self._devices)
+
+        def stop(self) -> None:
+            pass
+
+    import gi
+
+    gi.require_version("Gst", "1.0")
+    from gi.repository import Gst
+
+    monkeypatch.setattr(Gst, "DeviceMonitor", type("M", (), {"new": staticmethod(_Monitor)}))
+    monkeypatch.setattr(Gst, "is_initialized", staticmethod(lambda: True))
+
+    found = devices.enumerate_via_gstreamer()
+    assert [d.name for d in found] == ["mic"]
+
+
+def test_gstreamer_enumeration_failure_falls_back_to_pactl(monkeypatch) -> None:
+    def _explode():
+        raise RuntimeError("the device monitor blew up")
+
+    monkeypatch.setattr(devices, "enumerate_via_gstreamer", _explode)
+    monkeypatch.setattr(
+        devices,
+        "enumerate_via_pactl",
+        lambda: [AudioDevice(name="alsa_input.mic", label="Mic")],
+    )
+
+    assert [d.name for d in devices.list_input_devices()] == ["alsa_input.mic"]
+
+
+def test_gstreamer_enumeration_never_raises(monkeypatch) -> None:
+    """The documented contract: this is best-effort and cannot crash the UI."""
+
+    import gi
+
+    gi.require_version("Gst", "1.0")
+    from gi.repository import Gst
+
+    class _ExplodingMonitor:
+        @staticmethod
+        def new():
+            raise RuntimeError("no device monitor today")
+
+    monkeypatch.setattr(Gst, "DeviceMonitor", _ExplodingMonitor)
+    monkeypatch.setattr(Gst, "is_initialized", staticmethod(lambda: True))
+
+    assert devices.enumerate_via_gstreamer() == []
